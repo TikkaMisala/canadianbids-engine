@@ -72,13 +72,17 @@ def run_summarizer(db, anthropic_key, batch_size=50):
     client = anthropic.Anthropic(api_key=anthropic_key)
 
     # Load tenders without summaries
-    resp = db.table("tenders") \
-        .select("id, title, department, category, region, notice_type, procurement_method, selection_criteria, description") \
-        .is_("ai_summary", "null") \
-        .limit(batch_size) \
-        .execute()
-
-    tenders = resp.data or []
+    try:
+        resp = db.table("tenders") \
+            .select("id, title, department, category, region, notice_type, procurement_method, selection_criteria, description") \
+            .is_("ai_summary", "null") \
+            .limit(batch_size) \
+            .execute()
+        tenders = resp.data or []
+    except Exception as e:
+        print(f"Could not load tenders for summarization: {e}")
+        print("Make sure the ai_summary column exists: ALTER TABLE tenders ADD COLUMN ai_summary text;")
+        return {"summarized": 0, "errors": 0, "note": "ai_summary column missing"}
     print(f"Tenders without summaries: {len(tenders)}")
 
     if not tenders:

@@ -120,8 +120,8 @@ def run_matching(db, min_score=20, max_matches_per_user=25):
 
     # ── Load all profiles with completed onboarding ──
     print("\nLoading profiles...")
-    profiles_resp = db.table("profiles").select("*").eq("onboarding_complete", True).execute()
-    profiles = profiles_resp.data or []
+    profiles_resp = db.table("profiles").select("*").execute()
+    profiles = [p for p in (profiles_resp.data or []) if p.get("onboarding_complete") == True]
     print(f"  Profiles to match: {len(profiles)}")
 
     # ── Load all subscriptions ──
