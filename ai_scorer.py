@@ -66,8 +66,8 @@ TENDERS TO SCORE:
 
 For each tender, score from 0 to 40 based on capability match, scope fit, and geographic fit.
 
-Respond with ONLY a JSON array, no other text:
-[{{"id": "<tender_id>", "score": <0-40>, "reason": "<one sentence>"}}, ...]"""
+Respond with ONLY a JSON array, no other text. Use the tender number as the id:
+[{{"id": 1, "score": <0-40>, "reason": "<one sentence>"}}, ...]"""
 
 
 def build_profile_context(profile):
@@ -110,6 +110,7 @@ def score_batch(client, profile, tenders, batch_size=10):
     """
     Score a batch of tenders against a profile using Claude Haiku.
     Uses batched prompts to reduce API calls.
+    Uses numeric indices instead of UUIDs for reliable ID matching.
     
     Returns dict: {tender_id: {"score": int, "reason": str}}
     """
@@ -120,17 +121,19 @@ def score_batch(client, profile, tenders, batch_size=10):
     for i in range(0, len(tenders), batch_size):
         batch = tenders[i:i + batch_size]
         
-        # Build tender list for batch prompt
+        # Map numeric indices to real tender IDs
+        idx_to_id = {}
         tender_lines = []
-        for t in batch:
-            tid = t.get("id", "unknown")
+        for j, t in enumerate(batch):
+            idx = j + 1  # 1-based index
+            idx_to_id[str(idx)] = t.get("id", "unknown")
             title = t.get("title", "")[:100]
             dept = t.get("department", "")
             desc = (t.get("description") or "")[:200]
             cat = t.get("category", "")
             region = t.get("region", "")
             tender_lines.append(
-                f"ID: {tid}\n  Title: {title}\n  Department: {dept}\n  "
+                f"Tender {idx}:\n  Title: {title}\n  Department: {dept}\n  "
                 f"Category: {cat} | Region: {region}\n  Description: {desc}"
             )
         
@@ -139,39 +142,55 @@ def score_batch(client, profile, tenders, batch_size=10):
             tender_list="\n\n".join(tender_lines)
         )
         
-        try:
-            message = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1500,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            raw = message.content[0].text.strip()
-            # Clean potential markdown fences
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-                if raw.endswith("```"):
-                    raw = raw[:-3]
-                raw = raw.strip()
-            
-            scores = json.loads(raw)
-            
-            for item in scores:
-                tid = item.get("id", "")
-                score = max(0, min(40, int(item.get("score", 0))))
-                reason = item.get("reason", "")
-                results[tid] = {"score": score, "reason": reason}
+        # Retry up to 2 times for overload errors
+        for attempt in range(3):
+            try:
+                message = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=1500,
+                    messages=[{"role": "user", "content": prompt}]
+                )
                 
-        except json.JSONDecodeError as e:
-            print(f"  AI batch JSON error: {e}")
-            print(f"  Raw response: {raw[:200]}")
-            # Fall back to individual scoring for this batch
-            for t in batch:
-                results[t["id"]] = {"score": 0, "reason": "AI scoring unavailable"}
-        except Exception as e:
-            print(f"  AI batch error: {e}")
-            for t in batch:
-                results[t["id"]] = {"score": 0, "reason": "AI scoring unavailable"}
+                raw = message.content[0].text.strip()
+                # Clean potential markdown fences
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+                    if raw.endswith("```"):
+                        raw = raw[:-3]
+                    raw = raw.strip()
+                
+                scores = json.loads(raw)
+                
+                for item in scores:
+                    # Map numeric index back to real tender ID
+                    idx_str = str(item.get("id", ""))
+                    real_id = idx_to_id.get(idx_str, "")
+                    if not real_id:
+                        # Try matching by position if index doesn't map
+                        continue
+                    score = max(0, min(40, int(item.get("score", 0))))
+                    reason = item.get("reason", "")
+                    results[real_id] = {"score": score, "reason": reason}
+                
+                break  # Success, exit retry loop
+                    
+            except json.JSONDecodeError as e:
+                print(f"  AI batch JSON error: {e}")
+                print(f"  Raw response: {raw[:200]}")
+                for j, t in enumerate(batch):
+                    results[t["id"]] = {"score": 0, "reason": "AI scoring unavailable"}
+                break
+            except Exception as e:
+                err_msg = str(e)
+                if "529" in err_msg or "overloaded" in err_msg.lower():
+                    if attempt < 2:
+                        print(f"  AI overloaded, retrying in {2 * (attempt+1)}s...")
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                print(f"  AI batch error: {e}")
+                for j, t in enumerate(batch):
+                    results[t["id"]] = {"score": 0, "reason": "AI scoring unavailable"}
+                break
         
         # Rate limiting between batches
         if i + batch_size < len(tenders):
