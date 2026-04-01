@@ -73,6 +73,7 @@ def debug():
 
 
 
+@app.route("/api/match", methods=["GET", "POST"])
 def match():
     """Run the matching job for all users."""
     if not check_secret():
@@ -86,7 +87,7 @@ def match():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/summarize", methods=["POST"])
+@app.route("/api/summarize", methods=["GET", "POST"])
 def summarize():
     """Generate AI summaries for tenders that don't have one yet."""
     if not check_secret():
@@ -105,7 +106,7 @@ def summarize():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/run-all", methods=["POST"])
+@app.route("/api/run-all", methods=["GET", "POST"])
 def run_all():
     """Run both matching and summarizing — called by Railway cron daily."""
     if not check_secret():
