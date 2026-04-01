@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from matcher import run_matching, run_matching_single
 from summarizer import run_summarizer
 from datetime import datetime, timezone
+from scrape_documents import scrape_tender_documents, upsert_documents, mark_tender_scraped, run_full_scan
 
 load_dotenv()
 
@@ -288,6 +289,80 @@ def stripe_webhook():
                 print(f"  DB error updating subscription: {e}")
 
     return jsonify({"received": True})
+
+
+# ═══════════════════════════════════════════════════════════
+# DOCUMENT SCRAPER ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/api/tenders/<int:tender_id>/documents", methods=["GET", "OPTIONS"])
+def get_tender_documents(tender_id):
+    """Return all scraped documents for a tender."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    try:
+        result = db.table("tender_documents") \
+            .select("id, document_url, document_name, file_type, source, requires_login, scraped_at") \
+            .eq("tender_id", tender_id) \
+            .order("requires_login") \
+            .execute()
+        return jsonify({
+            "tender_id": tender_id,
+            "documents": result.data or [],
+            "count": len(result.data or []),
+        }), 200
+    except Exception as e:
+        print(f"get_tender_documents error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tenders/<int:tender_id>/scrape-documents", methods=["POST", "OPTIONS"])
+def trigger_document_scrape(tender_id):
+    """On-demand scrape for a single tender — called when user opens a tender with no docs yet."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    try:
+        tender = db.table("tenders") \
+            .select("id, notice_url, docs_scraped_at") \
+            .eq("id", tender_id) \
+            .single() \
+            .execute()
+
+        if not tender.data:
+            return jsonify({"error": "Tender not found"}), 404
+
+        notice_url = tender.data.get("notice_url")
+        if not notice_url:
+            return jsonify({"error": "No notice_url for this tender"}), 400
+
+        docs = scrape_tender_documents(tender_id, notice_url)
+        upsert_documents(docs)
+        mark_tender_scraped(tender_id, len(docs))
+
+        return jsonify({
+            "tender_id": tender_id,
+            "documents_found": len(docs),
+            "documents": docs,
+        }), 200
+    except Exception as e:
+        print(f"trigger_document_scrape error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/scrape-documents/batch", methods=["POST", "OPTIONS"])
+def batch_scrape_documents():
+    """Batch scrape — called by cron job to scrape up to N unscraped tenders."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    if not check_secret():
+        return jsonify({"error": "Forbidden"}), 403
+    limit = request.json.get("limit", 100) if request.is_json else 100
+    try:
+        run_full_scan(limit=limit, only_unscraped=True)
+        return jsonify({"status": "ok", "message": f"Batch scrape triggered (limit={limit})"}), 200
+    except Exception as e:
+        print(f"batch_scrape_documents error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
