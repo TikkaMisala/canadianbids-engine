@@ -24,6 +24,7 @@ from matcher import run_matching, run_matching_single
 from summarizer import run_summarizer
 from datetime import datetime, timezone
 from scrape_documents import scrape_tender_documents, upsert_documents, mark_tender_scraped, run_full_scan
+from fetch_canadabuys import run_fetch
 
 load_dotenv()
 
@@ -289,6 +290,26 @@ def stripe_webhook():
                 print(f"  DB error updating subscription: {e}")
 
     return jsonify({"received": True})
+
+
+# ═══════════════════════════════════════════════════════════
+# CANADABUYS TENDER FETCH
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/api/fetch-tenders", methods=["POST", "OPTIONS"])
+def fetch_tenders():
+    """Fetch latest tenders from CanadaBuys open data CSV. Called by cron."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    if not check_secret():
+        return jsonify({"error": "Forbidden"}), 403
+    new_only = request.json.get("new_only", False) if request.is_json else False
+    try:
+        result = run_fetch(new_only=new_only)
+        return jsonify({"status": "ok", **result}), 200
+    except Exception as e:
+        print(f"fetch_tenders error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════
