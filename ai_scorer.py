@@ -37,13 +37,13 @@ Notice type: {tender_notice_type}
 Procurement method: {tender_procurement_method}
 Selection criteria: {tender_selection_criteria}
 
-Score this tender from 0 to 40 based on:
+Score this tender from 0 to 35 based on:
 - How well the company's capabilities match what the tender requires (0-20)
 - How appropriate the tender scope/size is for this company (0-10)
 - Geographic and category fit (0-10)
 
 Respond with ONLY a JSON object, no other text:
-{{"score": <number 0-40>, "reason": "<one sentence explanation>"}}"""
+{{"score": <number 0-35>, "reason": "<one sentence explanation>"}}"""
 
 
 BATCH_PROMPT = """You are a Canadian federal procurement matching engine. Score how relevant each tender is for the company below.
@@ -64,10 +64,10 @@ Contract range: ${contract_min} – ${contract_max}
 TENDERS TO SCORE:
 {tender_list}
 
-For each tender, score from 0 to 40 based on capability match, scope fit, and geographic fit.
+For each tender, score from 0 to 35 based on capability match, scope fit, and geographic fit.
 
 Respond with ONLY a JSON array, no other text. Use the tender number as the id:
-[{{"id": 1, "score": <0-40>, "reason": "<one sentence>"}}, ...]"""
+[{{"id": 1, "score": <0-35>, "reason": "<one sentence>"}}, ...]"""
 
 
 def build_profile_context(profile):
@@ -168,7 +168,7 @@ def score_batch(client, profile, tenders, batch_size=10):
                     if not real_id:
                         # Try matching by position if index doesn't map
                         continue
-                    score = max(0, min(40, int(item.get("score", 0))))
+                    score = max(0, min(35, int(item.get("score", 0))))
                     reason = item.get("reason", "")
                     results[real_id] = {"score": score, "reason": reason}
                 
@@ -226,7 +226,7 @@ def score_single(client, profile, tender):
             raw = raw.strip()
         
         result = json.loads(raw)
-        score = max(0, min(40, int(result.get("score", 0))))
+        score = max(0, min(35, int(result.get("score", 0))))
         return {"score": score, "reason": result.get("reason", "")}
         
     except Exception as e:

@@ -6,9 +6,9 @@ Stage 2: AI semantic scoring via Claude Haiku → relevance + explanation
 Stage 3: Historical win data boost → patterns from similar companies
 
 Final score (0-100):
-  - Keyword/rule score:  0-40  (pre-filter, uses all profile fields)
-  - AI semantic score:   0-40  (Claude Haiku evaluation)
-  - History boost:       0-20  (vendor_history patterns)
+  - Keyword/rule score:  0-30  (pre-filter, uses all profile fields)
+  - AI semantic score:   0-35  (Claude Haiku evaluation)
+  - History boost:       0-35  (vendor_history patterns — strongest differentiator)
 """
 
 import re
@@ -31,7 +31,7 @@ def normalize(text):
 def keyword_score(tender, profile):
     """
     Rule-based scoring using all available profile fields.
-    Returns (score: 0-40, matched_keywords: list)
+    Returns (score: 0-30, matched_keywords: list)
     """
     score = 0
     matched_keywords = []
@@ -129,8 +129,8 @@ def keyword_score(tender, profile):
                 score += 2
                 break
 
-    # Cap at 40
-    score = min(score, 40)
+    # Cap at 30
+    score = min(score, 30)
     return score, matched_keywords
 
 
@@ -140,8 +140,8 @@ def keyword_score(tender, profile):
 
 def load_history_patterns(db, profile):
     """
-    Load vendor_history for the company and extract patterns.
-    Returns dict with department/category/keyword patterns and department win counts.
+    Load vendor_history for the company and extract rich patterns.
+    Tracks department wins, GSIN patterns, description terms, and contract values.
     """
     company_name = profile.get("company_name", "")
     if not company_name:
@@ -149,9 +149,9 @@ def load_history_patterns(db, profile):
 
     try:
         resp = db.table("vendor_history") \
-            .select("gsin_description_en, tender_description_en, procurement_category") \
+            .select("gsin_description_en, tender_description_en, procurement_category, contract_amount, total_contract_value") \
             .ilike("supplier_legal_name", f"%{company_name}%") \
-            .limit(100) \
+            .limit(200) \
             .execute()
         history = resp.data or []
     except Exception as e:
@@ -161,35 +161,56 @@ def load_history_patterns(db, profile):
     if not history:
         return None
 
-    # Extract patterns from past wins
     patterns = {
-        "categories": set(),
-        "description_terms": set(),
-        "gsin_terms": set(),
+        "categories": {},        # category → win count
+        "description_terms": {}, # term → frequency
+        "gsin_terms": {},        # term → frequency
         "total_wins": len(history),
+        "total_value": 0,
+        "avg_contract": 0,
+        "min_contract": None,
+        "max_contract": None,
     }
 
+    contract_values = []
+
     for row in history:
-        # Categories they've won in
+        # Category wins with counts
         cat = (row.get("procurement_category") or "").strip().upper()
         if cat:
-            patterns["categories"].add(cat)
+            patterns["categories"][cat] = patterns["categories"].get(cat, 0) + 1
 
-        # Terms from past tender descriptions
+        # Contract values
+        val = row.get("total_contract_value") or row.get("contract_amount") or 0
+        if val and val > 0:
+            contract_values.append(val)
+
+        # Terms from past tender descriptions — count frequency
         desc = normalize(row.get("tender_description_en") or "")
         for word in desc.split():
-            if len(word) > 4:  # Skip short words
-                patterns["description_terms"].add(word)
+            if len(word) > 4:
+                patterns["description_terms"][word] = patterns["description_terms"].get(word, 0) + 1
 
-        # GSIN terms
+        # GSIN terms with frequency
         gsin = normalize(row.get("gsin_description_en") or "")
         for word in gsin.split():
             if len(word) > 4:
-                patterns["gsin_terms"].add(word)
+                patterns["gsin_terms"][word] = patterns["gsin_terms"].get(word, 0) + 1
 
-    # Keep only most common terms (top 50) to avoid noise
-    patterns["description_terms"] = set(list(patterns["description_terms"])[:50])
-    patterns["gsin_terms"] = set(list(patterns["gsin_terms"])[:30])
+    # Contract value stats
+    if contract_values:
+        patterns["total_value"] = sum(contract_values)
+        patterns["avg_contract"] = sum(contract_values) / len(contract_values)
+        patterns["min_contract"] = min(contract_values)
+        patterns["max_contract"] = max(contract_values)
+
+    # Keep only terms that appear in multiple wins (stronger signal)
+    patterns["description_terms"] = {
+        k: v for k, v in sorted(patterns["description_terms"].items(), key=lambda x: -x[1])[:60]
+    }
+    patterns["gsin_terms"] = {
+        k: v for k, v in sorted(patterns["gsin_terms"].items(), key=lambda x: -x[1])[:30]
+    }
 
     return patterns
 
@@ -209,17 +230,29 @@ def generate_signals(tender, profile, patterns, kw_matches, ai_score):
     # ── History signals ──
     if patterns:
         total_wins = patterns.get("total_wins", 0)
+        tender_cat = (tender.get("category") or "").upper()
+        
         if total_wins > 0:
-            # Category match with past wins
-            if any(cat in tender_cat for cat in patterns["categories"]):
-                positive.append(f"You've won {total_wins} contracts in this procurement category before")
+            # Category match with specific win count
+            cat_wins = sum(count for cat, count in patterns["categories"].items() if cat in tender_cat)
+            
+            if cat_wins > 0:
+                positive.append(f"You've won {cat_wins} contract{'s' if cat_wins>1 else ''} in this category before")
             else:
                 warnings.append("New procurement category — no previous wins in this area")
 
-            # Description similarity
+            # Description similarity with specificity
             desc_overlap = sum(1 for t in patterns["description_terms"] if t in tender_text)
-            if desc_overlap >= 3:
-                positive.append("Tender description closely matches your past winning contracts")
+            if desc_overlap >= 6:
+                positive.append("Tender description strongly matches your past winning contracts")
+            elif desc_overlap >= 3:
+                positive.append("Tender description has similarities to contracts you've won")
+
+            # Contract value context
+            avg_val = patterns.get("avg_contract", 0)
+            total_val = patterns.get("total_value", 0)
+            if avg_val > 0:
+                positive.append(f"Your win history: {total_wins} contracts worth ${total_val:,.0f} (avg ${avg_val:,.0f})")
         else:
             warnings.append("No contract history found — build your track record")
     else:
@@ -304,7 +337,12 @@ def confidence_level(score, positive_count, warning_count):
 def history_boost(tender, patterns):
     """
     Score a tender based on historical win patterns.
-    Returns 0-20 boost score.
+    Returns 0-35 boost score. Previous wins are the strongest signal.
+    
+    Scoring:
+      - Category match with past wins:  0-10 (scaled by win count)
+      - Description similarity:         0-15 (weighted by term frequency)
+      - GSIN term overlap:              0-10 (weighted by term frequency)
     """
     if not patterns:
         return 0
@@ -316,27 +354,57 @@ def history_boost(tender, patterns):
     )
     tender_cat = (tender.get("category") or "").upper()
 
-    # Category match with past wins
-    if any(cat in tender_cat for cat in patterns["categories"]):
-        boost += 6
-
-    # Description term overlap with past wins
-    desc_overlap = sum(1 for term in patterns["description_terms"] if term in tender_text)
-    if desc_overlap >= 5:
+    # ── Category match with past wins (0-10) ──
+    # More wins in same category = stronger signal
+    cat_wins = 0
+    for cat, count in patterns["categories"].items():
+        if cat in tender_cat:
+            cat_wins += count
+    
+    if cat_wins >= 10:
+        boost += 10
+    elif cat_wins >= 5:
         boost += 8
-    elif desc_overlap >= 3:
-        boost += 5
-    elif desc_overlap >= 1:
+    elif cat_wins >= 3:
+        boost += 6
+    elif cat_wins >= 1:
+        boost += 4
+
+    # ── Description similarity (0-15) ──
+    # Weight by term frequency — terms that appeared in many past wins matter more
+    desc_score = 0
+    for term, freq in patterns["description_terms"].items():
+        if term in tender_text:
+            # Terms appearing in multiple past wins get more weight
+            desc_score += min(freq, 3)  # Cap per-term contribution at 3
+    
+    if desc_score >= 20:
+        boost += 15
+    elif desc_score >= 12:
+        boost += 12
+    elif desc_score >= 6:
+        boost += 8
+    elif desc_score >= 3:
+        boost += 4
+    elif desc_score >= 1:
         boost += 2
 
-    # GSIN term overlap
-    gsin_overlap = sum(1 for term in patterns["gsin_terms"] if term in tender_text)
-    if gsin_overlap >= 3:
-        boost += 6
-    elif gsin_overlap >= 1:
-        boost += 3
+    # ── GSIN term overlap (0-10) ──
+    gsin_score = 0
+    for term, freq in patterns["gsin_terms"].items():
+        if term in tender_text:
+            gsin_score += min(freq, 3)
+    
+    if gsin_score >= 10:
+        boost += 10
+    elif gsin_score >= 5:
+        boost += 7
+    elif gsin_score >= 2:
+        boost += 4
+    elif gsin_score >= 1:
+        boost += 2
 
-    return min(boost, 20)
+    return min(boost, 35)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -472,9 +540,9 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
                 tender = cand["tender"]
                 tid = tender.get("id", "")
 
-                kw = cand["kw_score"]                          # 0-40
-                ai = ai_scores.get(tid, {}).get("score", 0)    # 0-40
-                hist = history_boost(tender, patterns)           # 0-20
+                kw = cand["kw_score"]                          # 0-30
+                ai = ai_scores.get(tid, {}).get("score", 0)    # 0-35
+                hist = history_boost(tender, patterns)           # 0-35
                 total = min(kw + ai + hist, 100)
 
                 ai_reason = ai_scores.get(tid, {}).get("reason", "")
