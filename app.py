@@ -15,6 +15,8 @@ Environment variables required:
 """
 
 import os
+import json
+import stripe
 from flask import Flask, jsonify, request
 from supabase import create_client
 from dotenv import load_dotenv
@@ -31,6 +33,11 @@ SUPABASE_URL        = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY")
 CRON_SECRET         = os.environ.get("CRON_SECRET", "change-me-in-railway")
+STRIPE_SECRET_KEY   = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+FRONTEND_URL        = os.environ.get("FRONTEND_URL", "https://canadianbidsai.ca")
+
+stripe.api_key = STRIPE_SECRET_KEY
 
 db = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -162,6 +169,115 @@ def match_user(user_id):
     except Exception as e:
         print(f"Single user match error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+
+
+# ═══════════════════════════════════════════════════════════
+# STRIPE ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/api/create-checkout", methods=["POST"])
+def create_checkout():
+    """Create a Stripe Checkout session for Pro subscription."""
+    data = request.get_json() or {}
+    user_id = data.get("user_id")
+    email = data.get("email")
+    plan = data.get("plan", "monthly")  # 'monthly' or 'annual'
+
+    if not user_id or not email:
+        return jsonify({"error": "user_id and email required"}), 400
+
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Stripe not configured"}), 500
+
+    # Price IDs — set these in Railway env vars
+    MONTHLY_PRICE_ID = os.environ.get("STRIPE_MONTHLY_PRICE_ID")
+    ANNUAL_PRICE_ID = os.environ.get("STRIPE_ANNUAL_PRICE_ID")
+
+    price_id = ANNUAL_PRICE_ID if plan == "annual" else MONTHLY_PRICE_ID
+    if not price_id:
+        return jsonify({"error": f"Price ID for '{plan}' not configured"}), 500
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            customer_email=email,
+            metadata={"user_id": user_id},
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{FRONTEND_URL}?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_URL}?checkout=cancelled",
+            allow_promotion_codes=True,
+        )
+        return jsonify({"url": session.url, "session_id": session.id})
+    except Exception as e:
+        print(f"Stripe checkout error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/stripe-webhook", methods=["POST"])
+def stripe_webhook():
+    """Handle Stripe webhook events (subscription created, cancelled, etc.)."""
+    payload = request.get_data(as_text=True)
+    sig = request.headers.get("Stripe-Signature")
+
+    try:
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+        else:
+            event = json.loads(payload)
+    except (stripe.error.SignatureVerificationError, ValueError) as e:
+        print(f"Webhook signature error: {e}")
+        return jsonify({"error": "Invalid signature"}), 400
+
+    event_type = event.get("type", "")
+    data = event.get("data", {}).get("object", {})
+    print(f"Stripe webhook: {event_type}")
+
+    if event_type == "checkout.session.completed":
+        user_id = data.get("metadata", {}).get("user_id")
+        customer_id = data.get("customer")
+        subscription_id = data.get("subscription")
+
+        if user_id:
+            try:
+                db.table("subscriptions").upsert({
+                    "user_id": user_id,
+                    "plan": "pro",
+                    "status": "active",
+                    "stripe_customer_id": customer_id,
+                    "stripe_subscription_id": subscription_id,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                }).execute()
+                print(f"  ✓ Activated Pro for user {user_id[:8]}...")
+            except Exception as e:
+                print(f"  DB error activating subscription: {e}")
+
+    elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
+        subscription_id = data.get("id")
+        status = data.get("status")
+
+        if subscription_id:
+            try:
+                # Find subscription by stripe_subscription_id
+                resp = db.table("subscriptions") \
+                    .select("user_id") \
+                    .eq("stripe_subscription_id", subscription_id) \
+                    .execute()
+                if resp.data:
+                    user_id = resp.data[0]["user_id"]
+                    new_status = "active" if status == "active" else "cancelled"
+                    new_plan = "pro" if status == "active" else "free"
+                    db.table("subscriptions").update({
+                        "status": new_status,
+                        "plan": new_plan,
+                    }).eq("user_id", user_id).execute()
+                    print(f"  ✓ Updated subscription for {user_id[:8]}...: {new_status}")
+            except Exception as e:
+                print(f"  DB error updating subscription: {e}")
+
+    return jsonify({"received": True})
 
 
 if __name__ == "__main__":
