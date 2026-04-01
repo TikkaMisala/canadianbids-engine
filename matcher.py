@@ -141,7 +141,7 @@ def keyword_score(tender, profile):
 def load_history_patterns(db, profile):
     """
     Load vendor_history for the company and extract patterns.
-    Returns dict with department/category/keyword patterns.
+    Returns dict with department/category/keyword patterns and department win counts.
     """
     company_name = profile.get("company_name", "")
     if not company_name:
@@ -166,6 +166,7 @@ def load_history_patterns(db, profile):
         "categories": set(),
         "description_terms": set(),
         "gsin_terms": set(),
+        "total_wins": len(history),
     }
 
     for row in history:
@@ -191,6 +192,113 @@ def load_history_patterns(db, profile):
     patterns["gsin_terms"] = set(list(patterns["gsin_terms"])[:30])
 
     return patterns
+
+
+def generate_signals(tender, profile, patterns, kw_matches, ai_score):
+    """
+    Generate human-readable match signals (✓ positive, ⚠ warning).
+    Returns (positive_signals: list[str], warning_signals: list[str])
+    """
+    positive = []
+    warnings = []
+    tender_text = normalize(f"{tender.get('title','')} {tender.get('description','')}")
+    tender_dept = tender.get("department", "")
+    tender_cat = (tender.get("category") or "").upper()
+    tender_region = normalize(tender.get("region") or "")
+
+    # ── History signals ──
+    if patterns:
+        total_wins = patterns.get("total_wins", 0)
+        if total_wins > 0:
+            # Category match with past wins
+            if any(cat in tender_cat for cat in patterns["categories"]):
+                positive.append(f"You've won {total_wins} contracts in this procurement category before")
+            else:
+                warnings.append("New procurement category — no previous wins in this area")
+
+            # Description similarity
+            desc_overlap = sum(1 for t in patterns["description_terms"] if t in tender_text)
+            if desc_overlap >= 3:
+                positive.append("Tender description closely matches your past winning contracts")
+        else:
+            warnings.append("No contract history found — build your track record")
+    else:
+        warnings.append("No contract history found — this could be a good first win")
+
+    # ── Contract size signals ──
+    contract_min = profile.get("contract_min")
+    contract_max = profile.get("contract_max")
+    if contract_min or contract_max:
+        min_str = f"${contract_min:,}" if contract_min else "$0"
+        max_str = f"${contract_max:,}" if contract_max else "any"
+        positive.append(f"Contract size fits your typical range ({min_str}–{max_str})")
+
+    # ── Keyword/capability signals ──
+    if kw_matches and len(kw_matches) >= 2:
+        positive.append(f"Strong keyword alignment: {', '.join(kw_matches[:3])}")
+    elif kw_matches and len(kw_matches) == 1:
+        positive.append(f"Keyword match: {kw_matches[0]}")
+
+    # ── Certification signals ──
+    profile_certs = [c for c in (profile.get("certifications") or []) if c]
+    if profile_certs:
+        matched_certs = [c for c in profile_certs if normalize(c) in tender_text]
+        if matched_certs:
+            positive.append(f"Your {matched_certs[0]} certification qualifies")
+        # Check if tender requires certs the profile doesn't have
+        cert_terms = ["iso", "certified", "accredited", "certification"]
+        if any(term in tender_text for term in cert_terms) and not matched_certs:
+            warnings.append("Tender may require certifications — review requirements carefully")
+
+    # ── Security clearance signals ──
+    clearance_terms = {"secret": "Secret", "top secret": "Top Secret",
+                       "reliability": "Reliability", "protected": "Protected B"}
+    profile_clearance = (profile.get("clearance_level") or "").lower()
+    for term, label in clearance_terms.items():
+        if term in tender_text:
+            if profile_clearance and term in profile_clearance:
+                positive.append(f"Your {label} clearance meets the requirement")
+            elif profile_clearance and profile_clearance != "none":
+                warnings.append(f"Requires {label} clearance — verify your level covers this")
+            else:
+                warnings.append(f"Requires {label} clearance — verify you hold this")
+            break
+
+    # ── Region signals ──
+    profile_province = normalize(profile.get("province") or "")
+    profile_provs = [normalize(p) for p in (profile.get("provinces_operating") or [])]
+    delivers_nationally = profile.get("delivers_nationally", False)
+    all_regions = ([profile_province] if profile_province else []) + profile_provs
+
+    if any(r and r in tender_region for r in all_regions):
+        positive.append(f"Located in your operating region")
+    elif delivers_nationally or "national" in tender_region or "canada" in tender_region:
+        positive.append("National tender — open to all provinces")
+    elif tender_region:
+        warnings.append(f"Located in {tender.get('region','')} — outside your listed regions")
+
+    # ── AI confidence signal ──
+    if ai_score >= 30:
+        positive.append("AI analysis rates this as highly relevant to your capabilities")
+    elif ai_score >= 15:
+        positive.append("AI analysis sees good alignment with your profile")
+
+    return positive[:5], warnings[:3]  # Cap at 5 positive, 3 warnings
+
+
+def confidence_level(score, positive_count, warning_count):
+    """
+    Determine confidence level based on score and signal balance.
+    Returns one of: 'strong', 'likely', 'possible', 'weak'
+    """
+    if score >= 50 and positive_count >= 3 and warning_count <= 1:
+        return "strong"
+    elif score >= 35 and positive_count >= 2:
+        return "likely"
+    elif score >= 20 and positive_count >= 1:
+        return "possible"
+    else:
+        return "weak"
 
 
 def history_boost(tender, patterns):
@@ -371,6 +479,12 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
 
                 ai_reason = ai_scores.get(tid, {}).get("reason", "")
 
+                # Generate signals
+                pos_signals, warn_signals = generate_signals(
+                    tender, profile, patterns, cand["kw_matches"], ai
+                )
+                conf = confidence_level(total, len(pos_signals), len(warn_signals))
+
                 final_scored.append({
                     "tender": tender,
                     "score": total,
@@ -379,6 +493,9 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
                     "history_score": hist,
                     "kw_matches": cand["kw_matches"],
                     "ai_reason": ai_reason,
+                    "confidence": conf,
+                    "positive_signals": pos_signals,
+                    "warning_signals": warn_signals,
                 })
 
             # Sort by final score
@@ -393,6 +510,7 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
                 continue
 
             print(f"    Top match: {top_matches[0]['score']}% "
+                  f"({top_matches[0]['confidence']}) "
                   f"(kw:{top_matches[0]['kw_score']} ai:{top_matches[0]['ai_score']} "
                   f"hist:{top_matches[0]['history_score']})")
 
@@ -405,16 +523,19 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
                 is_locked = False if is_pro else (rank > 0)
 
                 rows.append({
-                    "user_id":         user_id,
-                    "tender_id":       tender["id"],
-                    "score":           m["score"],
-                    "kw_score":        m["kw_score"],
-                    "ai_score":        m["ai_score"],
-                    "history_score":   m["history_score"],
-                    "keyword_matches": m["kw_matches"],
-                    "ai_explanation":  m["ai_reason"],
-                    "is_locked":       is_locked,
-                    "matched_at":      datetime.now(timezone.utc).isoformat(),
+                    "user_id":           user_id,
+                    "tender_id":         tender["id"],
+                    "score":             m["score"],
+                    "kw_score":          m["kw_score"],
+                    "ai_score":          m["ai_score"],
+                    "history_score":     m["history_score"],
+                    "keyword_matches":   m["kw_matches"],
+                    "ai_explanation":    m["ai_reason"],
+                    "confidence":        m["confidence"],
+                    "positive_signals":  m["positive_signals"],
+                    "warning_signals":   m["warning_signals"],
+                    "is_locked":         is_locked,
+                    "matched_at":        datetime.now(timezone.utc).isoformat(),
                 })
 
             db.table("matches").insert(rows).execute()
@@ -500,10 +621,18 @@ def run_matching_single(db, user_id, anthropic_key=None):
         total = min(kw + ai + hist, 100)
         ai_reason = ai_scores.get(tid, {}).get("reason", "")
 
+        pos_signals, warn_signals = generate_signals(
+            t, profile, patterns, cand["kw_matches"], ai
+        )
+        conf = confidence_level(total, len(pos_signals), len(warn_signals))
+
         final.append({
             "tender": t, "score": total,
             "kw_score": kw, "ai_score": ai, "history_score": hist,
             "kw_matches": cand["kw_matches"], "ai_reason": ai_reason,
+            "confidence": conf,
+            "positive_signals": pos_signals,
+            "warning_signals": warn_signals,
         })
 
     final.sort(key=lambda x: x["score"], reverse=True)
@@ -521,6 +650,9 @@ def run_matching_single(db, user_id, anthropic_key=None):
             "history_score": m["history_score"],
             "keyword_matches": m["kw_matches"],
             "ai_explanation": m["ai_reason"],
+            "confidence": m["confidence"],
+            "positive_signals": m["positive_signals"],
+            "warning_signals": m["warning_signals"],
             "is_locked": False if is_pro else (rank > 0),
             "matched_at": datetime.now(timezone.utc).isoformat(),
         } for rank, m in enumerate(top)]
