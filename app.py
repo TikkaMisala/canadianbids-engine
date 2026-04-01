@@ -108,18 +108,31 @@ def summarize():
 
 @app.route("/api/run-all", methods=["GET", "POST"])
 def run_all():
-    """Run both matching and summarizing — called by Railway cron daily."""
+    """Run both matching and summarizing — called by daily cron.
+    Loops through ALL unsummarized tenders in batches of 25."""
     if not check_secret():
         return jsonify({"error": "Unauthorized"}), 401
 
     results = {}
 
-    # 1. Generate summaries for new tenders
+    # 1. Generate summaries — loop until all tenders are done
     if ANTHROPIC_API_KEY:
+        total_summarized = 0
+        total_errors = 0
         try:
-            results["summarize"] = run_summarizer(db, ANTHROPIC_API_KEY, batch_size=100)
+            for batch_num in range(20):  # Max 20 loops = 500 tenders
+                batch_result = run_summarizer(db, ANTHROPIC_API_KEY, batch_size=25)
+                total_summarized += batch_result.get("summarized", 0)
+                total_errors += batch_result.get("errors", 0)
+                if batch_result.get("summarized", 0) == 0:
+                    break  # All done
+            results["summarize"] = {
+                "summarized": total_summarized,
+                "errors": total_errors,
+                "batches_run": batch_num + 1,
+            }
         except Exception as e:
-            results["summarize"] = {"error": str(e)}
+            results["summarize"] = {"error": str(e), "summarized_before_error": total_summarized}
     else:
         results["summarize"] = {"skipped": "No ANTHROPIC_API_KEY set"}
 
