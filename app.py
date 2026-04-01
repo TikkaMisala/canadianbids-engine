@@ -22,6 +22,7 @@ from supabase import create_client
 from dotenv import load_dotenv
 from matcher import run_matching, run_matching_single
 from summarizer import run_summarizer
+from extractor import run_extractor
 from datetime import datetime, timezone
 from scrape_documents import scrape_tender_documents, upsert_documents, mark_tender_scraped, run_full_scan
 from fetch_canadabuys import run_fetch
@@ -125,6 +126,20 @@ def summarize():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/extract", methods=["GET", "POST"])
+def extract():
+    """Extract structured fields from tender descriptions using Claude."""
+    if not check_secret():
+        return jsonify({"error": "Unauthorized"}), 401
+    batch_size = int(request.args.get("batch", 25))
+    try:
+        result = run_extractor(batch_size=batch_size)
+        return jsonify({"status": "ok", **result})
+    except Exception as e:
+        print(f"Extractor error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/run-all", methods=["GET", "POST"])
 def run_all():
     """Run both matching and summarizing — called by daily cron.
@@ -160,6 +175,12 @@ def run_all():
         results["match"] = run_matching(db, anthropic_key=ANTHROPIC_API_KEY)
     except Exception as e:
         results["match"] = {"error": str(e)}
+
+    # 3. Extract structured fields from new tenders
+    try:
+        results["extract"] = run_extractor(batch_size=25)
+    except Exception as e:
+        results["extract"] = {"error": str(e)}
 
     return jsonify({"status": "ok", **results})
 
@@ -290,26 +311,6 @@ def stripe_webhook():
                 print(f"  DB error updating subscription: {e}")
 
     return jsonify({"received": True})
-
-
-# ═══════════════════════════════════════════════════════════
-# CANADABUYS TENDER FETCH
-# ═══════════════════════════════════════════════════════════
-
-@app.route("/api/fetch-tenders", methods=["POST", "OPTIONS"])
-def fetch_tenders():
-    """Fetch latest tenders from CanadaBuys open data CSV. Called by cron."""
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
-    if not check_secret():
-        return jsonify({"error": "Forbidden"}), 403
-    new_only = request.json.get("new_only", False) if request.is_json else False
-    try:
-        result = run_fetch(new_only=new_only)
-        return jsonify({"status": "ok", **result}), 200
-    except Exception as e:
-        print(f"fetch_tenders error: {e}")
-        return jsonify({"error": str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════
