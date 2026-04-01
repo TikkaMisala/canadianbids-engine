@@ -18,7 +18,6 @@ import os
 import json
 import stripe
 from flask import Flask, jsonify, request
-from flask_cors import CORS
 from supabase import create_client
 from dotenv import load_dotenv
 from matcher import run_matching, run_matching_single
@@ -28,7 +27,16 @@ from datetime import datetime, timezone
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, origins=["https://canadianbidsai.ca", "http://localhost:8788"])
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get('Origin', '')
+    allowed = ['https://canadianbidsai.ca', 'http://localhost:8788']
+    if origin in allowed:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return response
 
 # ── Config ──
 SUPABASE_URL        = os.environ.get("SUPABASE_URL")
