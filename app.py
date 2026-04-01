@@ -18,7 +18,7 @@ import os
 from flask import Flask, jsonify, request
 from supabase import create_client
 from dotenv import load_dotenv
-from matcher import run_matching
+from matcher import run_matching, run_matching_single
 from summarizer import run_summarizer
 from datetime import datetime, timezone
 
@@ -80,7 +80,7 @@ def match():
         return jsonify({"error": "Unauthorized"}), 401
 
     try:
-        result = run_matching(db)
+        result = run_matching(db, anthropic_key=ANTHROPIC_API_KEY)
         return jsonify({"status": "ok", **result})
     except Exception as e:
         print(f"Match job error: {e}")
@@ -123,9 +123,9 @@ def run_all():
     else:
         results["summarize"] = {"skipped": "No ANTHROPIC_API_KEY set"}
 
-    # 2. Run matching for all users
+    # 2. Run matching for all users (with AI scoring)
     try:
-        results["match"] = run_matching(db)
+        results["match"] = run_matching(db, anthropic_key=ANTHROPIC_API_KEY)
     except Exception as e:
         results["match"] = {"error": str(e)}
 
@@ -136,62 +136,16 @@ def run_all():
 def match_user(user_id):
     """
     Run matching for a single user — called when a user completes onboarding.
-    Useful so new users see matches immediately without waiting for daily cron.
+    Uses full 3-stage pipeline for instant results.
     """
     if not check_secret():
         return jsonify({"error": "Unauthorized"}), 401
 
     try:
-        # Load just this user's profile
-        profile_resp = db.table("profiles").select("*").eq("id", user_id).single().execute()
-        profile = profile_resp.data
-        if not profile:
-            return jsonify({"error": "Profile not found"}), 404
-
-        # Load all live tenders
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
-        tenders_resp = db.table("tenders").select("*").gt("closing_date", now).execute()
-        tenders = tenders_resp.data or []
-
-        # Load subscription
-        sub_resp = db.table("subscriptions").select("plan, status").eq("user_id", user_id).execute()
-        sub_data = sub_resp.data
-        sub = sub_data[0] if sub_data else {}
-        is_pro = sub.get("plan") == "pro" and sub.get("status") == "active"
-
-        from matcher import score_tender
-        scored = []
-        for tender in tenders:
-            score, keywords = score_tender(tender, profile)
-            if score >= 20:
-                scored.append({"score": score, "keywords": keywords, "tender": tender})
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        top = scored[:25]
-
-        # Delete existing matches
-        db.table("matches").delete().eq("user_id", user_id).execute()
-
-        # Insert new
-        if top:
-            rows = [{
-                "user_id":         user_id,
-                "tender_id":       m["tender"]["id"],
-                "score":           m["score"],
-                "keyword_matches": m["keywords"],
-                "is_locked":       False if is_pro else (rank > 0),
-                "matched_at":      datetime.now(timezone.utc).isoformat(),
-            } for rank, m in enumerate(top)]
-            db.table("matches").insert(rows).execute()
-
-        return jsonify({
-            "status": "ok",
-            "user_id": user_id,
-            "matches": len(top),
-            "top_score": top[0]["score"] if top else 0,
-        })
-
+        result = run_matching_single(db, user_id, anthropic_key=ANTHROPIC_API_KEY)
+        if "error" in result:
+            return jsonify(result), 404
+        return jsonify(result)
     except Exception as e:
         print(f"Single user match error: {e}")
         return jsonify({"error": str(e)}), 500
