@@ -52,7 +52,27 @@ def health():
     })
 
 
-@app.route("/api/match", methods=["POST"])
+@app.route("/api/debug", methods=["GET"])
+def debug():
+    """Debug endpoint to check DB connectivity and data."""
+    if not check_secret():
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        # Test profiles
+        profiles = db.table("profiles").select("id, company_name, onboarding_complete, keywords").execute()
+        # Test tenders count
+        tenders = db.table("tenders").select("id", count="exact").execute()
+        return jsonify({
+            "status": "ok",
+            "profiles": profiles.data,
+            "profile_count": len(profiles.data or []),
+            "tender_count": tenders.count,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
 def match():
     """Run the matching job for all users."""
     if not check_secret():
