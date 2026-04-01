@@ -105,10 +105,15 @@ def run_matching(db, min_score=20, max_matches_per_user=25):
     print(f"Starting matching job at {datetime.now(timezone.utc).isoformat()}")
     print(f"{'='*50}")
 
-    # ── Load all open tenders ──
-    print("\nLoading tenders...")
-    tenders_resp = db.table("tenders").select("*").execute()
-    tenders = tenders_resp.data or []
+    print(f"\nLoading tenders...")
+    try:
+        tenders_resp = db.table("tenders").select(
+            "id, title, description, department, category, region, procurement_method, selection_criteria, closing_date, notice_type, solicitation_number"
+        ).execute()
+        tenders = tenders_resp.data or []
+    except Exception as e:
+        print(f"ERROR loading tenders: {e}")
+        return {"users_matched": 0, "total_matches": 0, "live_tenders": 0, "errors": 1}
 
     # Filter to tenders with a future closing date
     now = datetime.now(timezone.utc).isoformat()
