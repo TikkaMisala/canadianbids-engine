@@ -104,6 +104,9 @@ def normalize_row(raw: dict) -> dict | None:
         mapped["solicitation_number"] = record_id
 
     mapped["updated_at"] = datetime.now(timezone.utc).isoformat()
+    mapped["source_level"] = "federal"
+    mapped["source_province"] = None
+    mapped["source_system"] = "canadabuys"
     return mapped
 
 
@@ -144,7 +147,7 @@ def upsert_tenders(rows: list[dict]) -> int:
     try:
         supabase.table("tenders").upsert(
             rows,
-            on_conflict="solicitation_number"
+            on_conflict="solicitation_number,source_system"
         ).execute()
         return len(rows)
     except Exception as e:

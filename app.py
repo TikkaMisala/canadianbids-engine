@@ -26,6 +26,7 @@ from extractor import run_extractor
 from datetime import datetime, timezone
 from scrape_documents import scrape_tender_documents, upsert_documents, mark_tender_scraped, run_full_scan
 from fetch_canadabuys import run_fetch
+from fetch_quebec_seao import run_fetch as run_fetch_quebec
 
 load_dotenv()
 
@@ -331,6 +332,49 @@ def fetch_tenders():
     except Exception as e:
         print(f"fetch_tenders error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/fetch-quebec", methods=["POST", "OPTIONS"])
+def fetch_quebec():
+    """Fetch Quebec provincial tenders from SEAO open data. Called by cron."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    if not check_secret():
+        return jsonify({"error": "Forbidden"}), 403
+    weeks = request.json.get("weeks", 4) if request.is_json else 4
+    try:
+        result = run_fetch_quebec(weeks=weeks)
+        return jsonify({"status": "ok", **result}), 200
+    except Exception as e:
+        print(f"fetch_quebec error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/fetch-all-sources", methods=["POST", "OPTIONS"])
+def fetch_all_sources():
+    """Fetch tenders from ALL sources — federal + provincial. Called by daily cron."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    if not check_secret():
+        return jsonify({"error": "Forbidden"}), 403
+
+    results = {}
+
+    # Federal — CanadaBuys
+    try:
+        results["federal"] = run_fetch(new_only=False)
+    except Exception as e:
+        results["federal"] = {"error": str(e)}
+        print(f"fetch federal error: {e}")
+
+    # Quebec — SEAO
+    try:
+        results["quebec"] = run_fetch_quebec(weeks=2)
+    except Exception as e:
+        results["quebec"] = {"error": str(e)}
+        print(f"fetch quebec error: {e}")
+
+    return jsonify({"status": "ok", "sources": results}), 200
 
 
 # ═══════════════════════════════════════════════════════════
