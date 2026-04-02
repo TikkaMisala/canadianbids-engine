@@ -314,6 +314,26 @@ def stripe_webhook():
 
 
 # ═══════════════════════════════════════════════════════════
+# CANADABUYS TENDER FETCH
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/api/fetch-tenders", methods=["POST", "OPTIONS"])
+def fetch_tenders():
+    """Fetch latest tenders from CanadaBuys open data CSV. Called by cron."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    if not check_secret():
+        return jsonify({"error": "Forbidden"}), 403
+    new_only = request.json.get("new_only", False) if request.is_json else False
+    try:
+        result = run_fetch(new_only=new_only)
+        return jsonify({"status": "ok", **result}), 200
+    except Exception as e:
+        print(f"fetch_tenders error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
 # DOCUMENT SCRAPER ENDPOINTS
 # ═══════════════════════════════════════════════════════════
 
