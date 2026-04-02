@@ -159,23 +159,28 @@ def extract_tenders(ocds_data: dict) -> list[dict]:
         if not tender_obj:
             continue
 
-        # We want tender-related releases
+        # We want tender-related releases — skip awards and contracts
+        if any(t in ["award", "awardUpdate", "contract", "contractUpdate", "contractAmendment"] for t in tags):
+            continue
+
         if not any(t in ["tender", "tenderUpdate", "tenderAmendment", "planning"] for t in tags):
             # Also include releases that have tender data even without explicit tag
             if not tender_obj.get("title"):
                 continue
 
-        # Check if tender is still open
+        # Check if tender is still open — REQUIRE a closing date
         tender_period = tender_obj.get("tenderPeriod", {})
         end_date_str = tender_period.get("endDate")
 
-        if end_date_str:
-            try:
-                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                if end_date < now:
-                    continue  # Already closed
-            except (ValueError, TypeError):
-                pass
+        if not end_date_str:
+            continue  # No closing date = not an open tender (likely an awarded contract)
+
+        try:
+            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+            if end_date < now:
+                continue  # Already closed
+        except (ValueError, TypeError):
+            continue  # Unparseable date, skip
 
         # Build a unique ID from OCDS data
         ocid = release.get("ocid", "")
