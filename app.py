@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from scrape_documents import scrape_tender_documents, upsert_documents, mark_tender_scraped, run_full_scan
 from fetch_canadabuys import run_fetch
 from fetch_quebec_seao import run_fetch as run_fetch_quebec
+from extract_quebec_leads import run_extract_leads
 
 load_dotenv()
 
@@ -385,6 +386,26 @@ def fetch_all_sources():
 
     threading.Thread(target=bg, daemon=True).start()
     return jsonify({"status": "accepted", "message": "All source fetch started"}), 202
+
+
+@app.route("/api/extract-quebec-leads", methods=["POST", "OPTIONS"])
+def extract_quebec_leads():
+    """Extract Quebec contract award winners into vendor_history for lead gen."""
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    if not check_secret():
+        return jsonify({"error": "Forbidden"}), 403
+    weeks = request.json.get("weeks", 26) if request.is_json else 26
+
+    def bg():
+        try:
+            result = run_extract_leads(weeks=weeks)
+            print(f"Quebec leads extraction done: {result}")
+        except Exception as e:
+            print(f"Quebec leads extraction error: {e}")
+
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({"status": "accepted", "message": f"Quebec lead extraction started ({weeks} weeks)"}), 202
 
 
 # ═══════════════════════════════════════════════════════════
