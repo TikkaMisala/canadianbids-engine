@@ -17,6 +17,7 @@ Environment variables required:
 import os
 import json
 import stripe
+import threading
 from flask import Flask, jsonify, request
 from supabase import create_client
 from dotenv import load_dotenv
@@ -100,12 +101,15 @@ def match():
     if not check_secret():
         return jsonify({"error": "Unauthorized"}), 401
 
-    try:
-        result = run_matching(db, anthropic_key=ANTHROPIC_API_KEY)
-        return jsonify({"status": "ok", **result})
-    except Exception as e:
-        print(f"Match job error: {e}")
-        return jsonify({"error": str(e)}), 500
+    def bg():
+        try:
+            result = run_matching(db, anthropic_key=ANTHROPIC_API_KEY)
+            print(f"Match job done: {result}")
+        except Exception as e:
+            print(f"Match job error: {e}")
+
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({"status": "accepted", "message": "Match job started"}), 202
 
 
 @app.route("/api/summarize", methods=["GET", "POST"])
@@ -113,18 +117,19 @@ def summarize():
     """Generate AI summaries for tenders that don't have one yet."""
     if not check_secret():
         return jsonify({"error": "Unauthorized"}), 401
-
     if not ANTHROPIC_API_KEY:
         return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
 
-    batch_size = int(request.args.get("batch", 50))
+    def bg():
+        try:
+            batch_size = 50
+            result = run_summarizer(db, ANTHROPIC_API_KEY, batch_size=batch_size)
+            print(f"Summarize done: {result}")
+        except Exception as e:
+            print(f"Summarize job error: {e}")
 
-    try:
-        result = run_summarizer(db, ANTHROPIC_API_KEY, batch_size=batch_size)
-        return jsonify({"status": "ok", **result})
-    except Exception as e:
-        print(f"Summarize job error: {e}")
-        return jsonify({"error": str(e)}), 500
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({"status": "accepted", "message": "Summarize job started"}), 202
 
 
 @app.route("/api/extract", methods=["GET", "POST"])
@@ -132,58 +137,58 @@ def extract():
     """Extract structured fields from tender descriptions using Claude."""
     if not check_secret():
         return jsonify({"error": "Unauthorized"}), 401
-    batch_size = int(request.args.get("batch", 25))
-    try:
-        result = run_extractor(batch_size=batch_size)
-        return jsonify({"status": "ok", **result})
-    except Exception as e:
-        print(f"Extractor error: {e}")
-        return jsonify({"error": str(e)}), 500
+
+    def bg():
+        try:
+            result = run_extractor(batch_size=25)
+            print(f"Extractor done: {result}")
+        except Exception as e:
+            print(f"Extractor error: {e}")
+
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({"status": "accepted", "message": "Extract job started"}), 202
 
 
 @app.route("/api/run-all", methods=["GET", "POST"])
 def run_all():
-    """Run both matching and summarizing — called by daily cron.
-    Loops through ALL unsummarized tenders in batches of 25."""
+    """Run summarize + match + extract — called by daily cron.
+    Returns immediately, processes in background."""
     if not check_secret():
         return jsonify({"error": "Unauthorized"}), 401
 
-    results = {}
+    def bg():
+        print("=== run-all background job started ===")
+        # 1. Generate summaries — loop until all tenders are done
+        if ANTHROPIC_API_KEY:
+            total_summarized = 0
+            try:
+                for batch_num in range(20):
+                    batch_result = run_summarizer(db, ANTHROPIC_API_KEY, batch_size=25)
+                    total_summarized += batch_result.get("summarized", 0)
+                    if batch_result.get("summarized", 0) == 0:
+                        break
+                print(f"  Summarized: {total_summarized} in {batch_num + 1} batches")
+            except Exception as e:
+                print(f"  Summarize error: {e}")
 
-    # 1. Generate summaries — loop until all tenders are done
-    if ANTHROPIC_API_KEY:
-        total_summarized = 0
-        total_errors = 0
+        # 2. Run matching
         try:
-            for batch_num in range(20):  # Max 20 loops = 500 tenders
-                batch_result = run_summarizer(db, ANTHROPIC_API_KEY, batch_size=25)
-                total_summarized += batch_result.get("summarized", 0)
-                total_errors += batch_result.get("errors", 0)
-                if batch_result.get("summarized", 0) == 0:
-                    break  # All done
-            results["summarize"] = {
-                "summarized": total_summarized,
-                "errors": total_errors,
-                "batches_run": batch_num + 1,
-            }
+            match_result = run_matching(db, anthropic_key=ANTHROPIC_API_KEY)
+            print(f"  Match result: {match_result}")
         except Exception as e:
-            results["summarize"] = {"error": str(e), "summarized_before_error": total_summarized}
-    else:
-        results["summarize"] = {"skipped": "No ANTHROPIC_API_KEY set"}
+            print(f"  Match error: {e}")
 
-    # 2. Run matching for all users (with AI scoring)
-    try:
-        results["match"] = run_matching(db, anthropic_key=ANTHROPIC_API_KEY)
-    except Exception as e:
-        results["match"] = {"error": str(e)}
+        # 3. Extract structured fields
+        try:
+            extract_result = run_extractor(batch_size=25)
+            print(f"  Extract result: {extract_result}")
+        except Exception as e:
+            print(f"  Extract error: {e}")
 
-    # 3. Extract structured fields from new tenders
-    try:
-        results["extract"] = run_extractor(batch_size=25)
-    except Exception as e:
-        results["extract"] = {"error": str(e)}
+        print("=== run-all background job complete ===")
 
-    return jsonify({"status": "ok", **results})
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({"status": "accepted", "message": "run-all started in background"}), 202
 
 
 @app.route("/api/match-user/<user_id>", methods=["POST"])
@@ -325,13 +330,16 @@ def fetch_tenders():
         return jsonify({}), 200
     if not check_secret():
         return jsonify({"error": "Forbidden"}), 403
-    new_only = request.json.get("new_only", False) if request.is_json else False
-    try:
-        result = run_fetch(new_only=new_only)
-        return jsonify({"status": "ok", **result}), 200
-    except Exception as e:
-        print(f"fetch_tenders error: {e}")
-        return jsonify({"error": str(e)}), 500
+
+    def bg():
+        try:
+            result = run_fetch(new_only=False)
+            print(f"fetch-tenders done: {result}")
+        except Exception as e:
+            print(f"fetch-tenders error: {e}")
+
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({"status": "accepted", "message": "Federal fetch started"}), 202
 
 
 @app.route("/api/fetch-quebec", methods=["POST", "OPTIONS"])
@@ -341,13 +349,16 @@ def fetch_quebec():
         return jsonify({}), 200
     if not check_secret():
         return jsonify({"error": "Forbidden"}), 403
-    weeks = request.json.get("weeks", 4) if request.is_json else 4
-    try:
-        result = run_fetch_quebec(weeks=weeks)
-        return jsonify({"status": "ok", **result}), 200
-    except Exception as e:
-        print(f"fetch_quebec error: {e}")
-        return jsonify({"error": str(e)}), 500
+
+    def bg():
+        try:
+            result = run_fetch_quebec(weeks=4)
+            print(f"fetch-quebec done: {result}")
+        except Exception as e:
+            print(f"fetch-quebec error: {e}")
+
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({"status": "accepted", "message": "Quebec fetch started"}), 202
 
 
 @app.route("/api/fetch-all-sources", methods=["POST", "OPTIONS"])
@@ -358,23 +369,22 @@ def fetch_all_sources():
     if not check_secret():
         return jsonify({"error": "Forbidden"}), 403
 
-    results = {}
+    def bg():
+        print("=== fetch-all-sources started ===")
+        try:
+            result = run_fetch(new_only=False)
+            print(f"  Federal: {result}")
+        except Exception as e:
+            print(f"  Federal error: {e}")
+        try:
+            result = run_fetch_quebec(weeks=2)
+            print(f"  Quebec: {result}")
+        except Exception as e:
+            print(f"  Quebec error: {e}")
+        print("=== fetch-all-sources complete ===")
 
-    # Federal — CanadaBuys
-    try:
-        results["federal"] = run_fetch(new_only=False)
-    except Exception as e:
-        results["federal"] = {"error": str(e)}
-        print(f"fetch federal error: {e}")
-
-    # Quebec — SEAO
-    try:
-        results["quebec"] = run_fetch_quebec(weeks=2)
-    except Exception as e:
-        results["quebec"] = {"error": str(e)}
-        print(f"fetch quebec error: {e}")
-
-    return jsonify({"status": "ok", "sources": results}), 200
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({"status": "accepted", "message": "All source fetch started"}), 202
 
 
 # ═══════════════════════════════════════════════════════════
