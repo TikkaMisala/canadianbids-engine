@@ -1,20 +1,45 @@
 """
-matcher.py — CanadianBids.ai 3-stage matching pipeline.
+matcher.py — CanadianBids.ai matching pipeline (v4, hybrid deterministic + AI).
 
-Stage 1: Keyword/rule-based pre-filter (fast, free) → top 50 candidates
-Stage 2: AI semantic scoring via Claude Haiku → relevance + explanation
-Stage 3: Historical win data boost → patterns from similar companies
+Pipeline:
+  Stage 1: Keyword pre-filter (fast, free) → top 100 candidates
+  Stage 2: Deterministic checks (geo, clearance, certs, scale, vehicle)
+           - Hard gates: geography + clearance (drop on fail)
+           - Scored: certs (0-3) + scale (0-5) + vehicle (0-2)
+  Stage 3: AI semantic scoring on survivors
+           - domain_match (gate, drop on false)
+           - capability_score (0-15)
+  Stage 4: History boost (vendor_history patterns) → 0-15
 
-Final score (0-100):
-  - Keyword/rule score:  0-30  (pre-filter, uses all profile fields)
-  - AI semantic score:   0-35  (Claude Haiku evaluation)
-  - History boost:       0-35  (vendor_history patterns — strongest differentiator)
+Final score components (max 60, normalized to 0-100 for display):
+  keyword_score        0-20  (capped from raw 0-30)
+  capability_score     0-15  (AI)
+  cert_score           0-3   (code)
+  scale_score          0-5   (code)
+  vehicle_score        0-2   (code)
+  history_boost        0-15  (capped from raw 0-35)
+
+Why hybrid:
+  - AI is reserved for the question only AI can answer well: does the
+    company's actual business align with the tender's actual industry,
+    and could they realistically deliver the work?
+  - Geography, clearance level, contract value vs. company size, and
+    cert matching are deterministic facts. Code handles them faster,
+    cheaper, and without hallucinations.
+  - Hard gates (geo + clearance) drop tenders before the AI sees them,
+    saving tokens and producing explainable rejections.
+
+Default-to-inclusion principle:
+  Missing data → PASS / full points. We only penalize when there is
+  positive evidence of mismatch. CanadaBuys data quality is patchy;
+  we do not punish users for the data source's gaps.
 """
 
 import re
 import anthropic
 from datetime import datetime, timezone
 from ai_scorer import score_batch, score_single
+from tender_checks import run_deterministic_checks
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -411,14 +436,22 @@ def history_boost(tender, patterns):
 # MAIN PIPELINE
 # ═══════════════════════════════════════════════════════════════════
 
-def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter_top=50):
+def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter_top=100):
     """
-    Full 3-stage matching pipeline.
-    
+    Full v4 hybrid matching pipeline.
+
     Stage 1: Keyword pre-filter all live tenders → top N candidates
-    Stage 2: AI semantic scoring on candidates (if API key available)
-    Stage 3: Historical win data boost
-    Final:   Blend scores, rank, write to matches table
+    Stage 2: Deterministic checks (geo, clearance, certs, scale, vehicle)
+             - Hard gates: geography + clearance (drop on fail)
+             - Scored: certs (0-3), scale (0-5), vehicle (0-2)
+    Stage 3: AI semantic scoring on survivors
+             - Simplified prompt: domain_match + capability (0-15) only
+             - Drop tenders flagged domain_match=false
+    Stage 4: Historical win data boost (rescaled to 0-15 from raw 0-35)
+    Final:   Blend, normalize to 0-100, rank, write to matches table
+
+    prefilter_top default 100 — wider candidate pool because we now
+    filter aggressively in Stage 2 (hard gates) and Stage 3 (domain).
     """
     print(f"\n{'='*60}")
     print(f"Starting 3-stage matching pipeline")
@@ -502,11 +535,42 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
                 continue
 
             # ════════════════════════════════
-            # STAGE 2: AI Semantic Scoring
+            # STAGE 2: Deterministic Checks
+            # ════════════════════════════════
+            # Geography + clearance are hard gates: tenders that fail
+            # either are dropped before the AI sees them. Cert, scale,
+            # and vehicle scoring is computed here too — the AI never
+            # touches these because they're deterministic facts.
+            print(f"  [Stage 2] Deterministic checks (geo, clearance, certs, scale, vehicle)...")
+            geo_rejected = 0
+            clearance_rejected = 0
+            kept = []
+            for cand in candidates:
+                checks = run_deterministic_checks(cand["tender"], profile)
+                cand["checks"] = checks
+                if checks["hard_reject"]:
+                    if not checks["geo"]["pass"]:
+                        geo_rejected += 1
+                    elif not checks["clearance"]["pass"]:
+                        clearance_rejected += 1
+                    continue
+                kept.append(cand)
+            if geo_rejected or clearance_rejected:
+                print(f"    Hard gates dropped {geo_rejected} on geography, "
+                      f"{clearance_rejected} on clearance")
+            candidates = kept
+            print(f"    {len(candidates)} candidates passed deterministic gates")
+
+            if not candidates:
+                print(f"    No candidates passed hard gates")
+                continue
+
+            # ════════════════════════════════
+            # STAGE 3: AI Semantic Scoring (domain + capability only)
             # ════════════════════════════════
             ai_scores = {}
             if ai_client and candidates:
-                print(f"  [Stage 2] AI semantic scoring ({len(candidates)} tenders)...")
+                print(f"  [Stage 3] AI semantic scoring ({len(candidates)} tenders)...")
                 try:
                     ai_scores = score_batch(
                         ai_client,
@@ -515,14 +579,37 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
                         batch_size=10
                     )
                     scored_count = sum(1 for v in ai_scores.values() if v["score"] > 0)
-                    print(f"    AI scored {scored_count}/{len(candidates)} with >0 relevance")
+                    print(f"    AI scored {scored_count}/{len(candidates)} with >0 capability")
                 except Exception as e:
                     print(f"    AI scoring failed: {e}")
 
+            # ────────────────────────────────
+            # STAGE 3b: Domain Mismatch Filter
+            # ────────────────────────────────
+            # The AI also returns a domain_match boolean. Drop tenders
+            # explicitly flagged as domain mismatches. Missing field
+            # defaults to True (fail-safe — fall back to keyword + history).
+            domain_rejected = 0
+            kept_candidates = []
+            for cand in candidates:
+                tid = cand["tender"].get("id", "")
+                ai_data = ai_scores.get(tid, {})
+                if ai_data.get("domain_match", True) is False:
+                    domain_rejected += 1
+                    continue
+                kept_candidates.append(cand)
+            if domain_rejected:
+                print(f"    Domain filter dropped {domain_rejected} mismatched tenders")
+            candidates = kept_candidates
+
+            if not candidates:
+                print(f"    No candidates remain after domain filter")
+                continue
+
             # ════════════════════════════════
-            # STAGE 3: Historical Win Boost
+            # STAGE 4: Historical Win Boost
             # ════════════════════════════════
-            print(f"  [Stage 3] Historical win data boost...")
+            print(f"  [Stage 4] Historical win data boost...")
             patterns = load_history_patterns(db, profile)
             if patterns:
                 cat_count = len(patterns["categories"])
@@ -532,38 +619,79 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
                 print(f"    No history found for {company}")
 
             # ════════════════════════════════
-            # FINAL: Blend Scores
+            # FINAL: Blend Scores (v4 weights, max 60 → normalized to 100)
             # ════════════════════════════════
             print(f"  [Final] Blending scores...")
             final_scored = []
             for cand in candidates:
                 tender = cand["tender"]
                 tid = tender.get("id", "")
+                checks = cand["checks"]
 
-                kw = cand["kw_score"]                          # 0-30
-                ai = ai_scores.get(tid, {}).get("score", 0)    # 0-35
-                hist = history_boost(tender, patterns)           # 0-35
-                total = min(kw + ai + hist, 100)
+                # Component scores under v4:
+                kw_raw = cand["kw_score"]                                  # 0-30 from keyword stage
+                kw = min(kw_raw, 20)                                       # cap to 20
+                cap = ai_scores.get(tid, {}).get("score", 0)               # 0-15 (AI capability)
+                cap = min(cap, 15)                                         # safety cap
+                cert = checks["certs"]["score"]                            # 0-3
+                scale = checks["scale"]["score"]                           # 0-5
+                vehicle = checks["vehicle"]["score"]                       # 0-2
+                hist_raw = history_boost(tender, patterns)                 # 0-35 from history stage
+                hist = min(round(hist_raw * 15 / 35), 15)                  # rescale to 0-15
+
+                # Sum: max 20 + 15 + 3 + 5 + 2 + 15 = 60
+                raw_total = kw + cap + cert + scale + vehicle + hist
+                # Normalize to 0-100 for display & DB compatibility
+                total = round(raw_total * 100 / 60)
+                total = max(0, min(total, 100))
 
                 ai_reason = ai_scores.get(tid, {}).get("reason", "")
 
-                # Generate signals
+                # Generate signals (note: AI capability score 0-15 in v4,
+                # but generate_signals expects something to indicate AI
+                # quality. We pass capability score scaled.)
                 pos_signals, warn_signals = generate_signals(
-                    tender, profile, patterns, cand["kw_matches"], ai
+                    tender, profile, patterns, cand["kw_matches"], cap
                 )
+
+                # Surface deterministic facts as signals when relevant
+                if checks["clearance"]["pass"] and checks["clearance"].get("required_level"):
+                    pos_signals.append(
+                        f"You meet the {checks['clearance']['required_level']} clearance requirement"
+                    )
+                if checks["certs"]["matched_certs"]:
+                    pos_signals.append(
+                        f"Cert match: {', '.join(checks['certs']['matched_certs'])}"
+                    )
+                if checks["vehicle"]["matched_arrangements"]:
+                    pos_signals.append(
+                        f"You're on this arrangement: {', '.join(checks['vehicle']['matched_arrangements'])}"
+                    )
+                if checks["scale"]["in_range"] is False:
+                    tv = checks["scale"]["tender_value"]
+                    if tv:
+                        warn_signals.append(
+                            f"Contract value (~${tv:,.0f}) is outside your typical range"
+                        )
+
                 conf = confidence_level(total, len(pos_signals), len(warn_signals))
 
                 final_scored.append({
                     "tender": tender,
                     "score": total,
                     "kw_score": kw,
-                    "ai_score": ai,
+                    "ai_score": cap,           # capability score (renamed from ai_score for DB compat)
                     "history_score": hist,
+                    "cert_score": cert,
+                    "scale_score": scale,
+                    "vehicle_score": vehicle,
                     "kw_matches": cand["kw_matches"],
                     "ai_reason": ai_reason,
                     "confidence": conf,
                     "positive_signals": pos_signals,
                     "warning_signals": warn_signals,
+                    # Surface deterministic check details for debugging / future UI use
+                    "checks": checks,
                 })
 
             # Sort by final score
@@ -579,8 +707,9 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
 
             print(f"    Top match: {top_matches[0]['score']}% "
                   f"({top_matches[0]['confidence']}) "
-                  f"(kw:{top_matches[0]['kw_score']} ai:{top_matches[0]['ai_score']} "
-                  f"hist:{top_matches[0]['history_score']})")
+                  f"(kw:{top_matches[0]['kw_score']} cap:{top_matches[0]['ai_score']} "
+                  f"cert:{top_matches[0]['cert_score']} scale:{top_matches[0]['scale_score']} "
+                  f"veh:{top_matches[0]['vehicle_score']} hist:{top_matches[0]['history_score']})")
 
             # ── Write to matches table ──
             db.table("matches").delete().eq("user_id", user_id).execute()
@@ -629,14 +758,15 @@ def run_matching(db, anthropic_key=None, min_score=15, max_matches=25, prefilter
         "total_matches": total_matches,
         "live_tenders": len(live_tenders),
         "errors": errors,
-        "pipeline": "v2-3stage",
+        "pipeline": "v4-hybrid",
     }
 
 
 def run_matching_single(db, user_id, anthropic_key=None):
     """
-    Run the full 3-stage pipeline for a single user.
+    Run the full v4 pipeline for a single user.
     Called when a user completes onboarding for instant results.
+    Mirrors run_matching but for one user, with smaller candidate pool.
     """
     print(f"\n── Single-user match: {user_id[:8]}... ──")
 
@@ -664,9 +794,19 @@ def run_matching_single(db, user_id, anthropic_key=None):
             prefiltered.append({"tender": tender, "kw_score": kw, "kw_matches": matches})
 
     prefiltered.sort(key=lambda x: x["kw_score"], reverse=True)
-    candidates = prefiltered[:50]
+    candidates = prefiltered[:50]   # smaller pool for single-user (faster onboarding)
 
-    # Stage 2: AI scoring
+    # Stage 2: Deterministic checks (same as run_matching)
+    kept = []
+    for cand in candidates:
+        checks = run_deterministic_checks(cand["tender"], profile)
+        cand["checks"] = checks
+        if checks["hard_reject"]:
+            continue
+        kept.append(cand)
+    candidates = kept
+
+    # Stage 3: AI scoring (capability + domain_match)
     ai_scores = {}
     if anthropic_key and candidates:
         try:
@@ -675,28 +815,66 @@ def run_matching_single(db, user_id, anthropic_key=None):
         except Exception as e:
             print(f"  AI scoring failed: {e}")
 
-    # Stage 3: History boost
+    # Stage 3b: Domain mismatch filter
+    kept_candidates = []
+    for cand in candidates:
+        tid = cand["tender"].get("id", "")
+        ai_data = ai_scores.get(tid, {})
+        if ai_data.get("domain_match", True) is False:
+            continue
+        kept_candidates.append(cand)
+    candidates = kept_candidates
+
+    # Stage 4: History boost
     patterns = load_history_patterns(db, profile)
 
-    # Blend
+    # Blend (v4 weights — see run_matching for the full formula)
     final = []
     for cand in candidates:
         t = cand["tender"]
         tid = t.get("id", "")
-        kw = cand["kw_score"]
-        ai = ai_scores.get(tid, {}).get("score", 0)
-        hist = history_boost(t, patterns)
-        total = min(kw + ai + hist, 100)
-        ai_reason = ai_scores.get(tid, {}).get("reason", "")
+        checks = cand["checks"]
 
+        kw = min(cand["kw_score"], 20)                              # 0-20
+        cap = min(ai_scores.get(tid, {}).get("score", 0), 15)       # 0-15
+        cert = checks["certs"]["score"]                             # 0-3
+        scale = checks["scale"]["score"]                            # 0-5
+        vehicle = checks["vehicle"]["score"]                        # 0-2
+        hist_raw = history_boost(t, patterns)                       # 0-35
+        hist = min(round(hist_raw * 15 / 35), 15)                   # rescale to 0-15
+
+        raw_total = kw + cap + cert + scale + vehicle + hist
+        total = max(0, min(round(raw_total * 100 / 60), 100))
+
+        ai_reason = ai_scores.get(tid, {}).get("reason", "")
         pos_signals, warn_signals = generate_signals(
-            t, profile, patterns, cand["kw_matches"], ai
+            t, profile, patterns, cand["kw_matches"], cap
         )
+
+        # Add deterministic-derived signals
+        if checks["clearance"]["pass"] and checks["clearance"].get("required_level"):
+            pos_signals.append(
+                f"You meet the {checks['clearance']['required_level']} clearance requirement"
+            )
+        if checks["certs"]["matched_certs"]:
+            pos_signals.append(f"Cert match: {', '.join(checks['certs']['matched_certs'])}")
+        if checks["vehicle"]["matched_arrangements"]:
+            pos_signals.append(
+                f"You're on this arrangement: {', '.join(checks['vehicle']['matched_arrangements'])}"
+            )
+        if checks["scale"]["in_range"] is False:
+            tv = checks["scale"]["tender_value"]
+            if tv:
+                warn_signals.append(
+                    f"Contract value (~${tv:,.0f}) is outside your typical range"
+                )
+
         conf = confidence_level(total, len(pos_signals), len(warn_signals))
 
         final.append({
             "tender": t, "score": total,
-            "kw_score": kw, "ai_score": ai, "history_score": hist,
+            "kw_score": kw, "ai_score": cap, "history_score": hist,
+            "cert_score": cert, "scale_score": scale, "vehicle_score": vehicle,
             "kw_matches": cand["kw_matches"], "ai_reason": ai_reason,
             "confidence": conf,
             "positive_signals": pos_signals,
@@ -731,5 +909,5 @@ def run_matching_single(db, user_id, anthropic_key=None):
         "user_id": user_id,
         "matches": len(top),
         "top_score": top[0]["score"] if top else 0,
-        "pipeline": "v2-3stage",
+        "pipeline": "v4-hybrid",
     }
