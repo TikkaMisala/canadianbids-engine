@@ -40,7 +40,7 @@ def add_cors_headers(response):
     allowed = ['https://canadianbidsai.ca', 'http://localhost:8788']
     if origin in allowed:
         response.headers['Access-Control-Allow-Origin'] = origin
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
@@ -192,13 +192,53 @@ def run_all():
     return jsonify({"status": "accepted", "message": "run-all started in background"}), 202
 
 
-@app.route("/api/match-user/<user_id>", methods=["POST"])
+@app.route("/api/match-user/<user_id>", methods=["POST", "OPTIONS"])
 def match_user(user_id):
     """
-    Run matching for a single user — called when a user completes onboarding.
-    Uses full 3-stage pipeline for instant results.
+    Run matching for a single user — called by the frontend right
+    after a user completes onboarding so they see matches immediately
+    instead of waiting up to 12 hours for the cron job.
+
+    Auth: requires a valid Supabase JWT in the Authorization header
+    (Bearer <token>). The JWT's user_id MUST match the user_id in the
+    URL path — a user can only trigger matching for themselves.
+
+    The legacy CRON_SECRET path is also accepted for backwards
+    compatibility (e.g., manual admin triggers via curl with
+    X-Cron-Secret header).
     """
-    if not check_secret():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    # ── Auth: accept either CRON_SECRET (admin) or Supabase JWT (user) ──
+    is_authorized = False
+
+    # Path 1: cron secret (legacy / admin path)
+    if check_secret():
+        is_authorized = True
+
+    # Path 2: Supabase JWT — must belong to the user_id in the URL
+    if not is_authorized:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            try:
+                # Validate the JWT against Supabase. This call returns
+                # the user object if the token is valid, else raises.
+                user_resp = db.auth.get_user(token)
+                authed_user = getattr(user_resp, "user", None)
+                if authed_user and getattr(authed_user, "id", None) == user_id:
+                    is_authorized = True
+                else:
+                    # Token valid but for a different user — refuse
+                    return jsonify({
+                        "error": "Forbidden — token does not match user_id"
+                    }), 403
+            except Exception as e:
+                print(f"JWT validation failed: {e}")
+                return jsonify({"error": "Invalid token"}), 401
+
+    if not is_authorized:
         return jsonify({"error": "Unauthorized"}), 401
 
     try:
